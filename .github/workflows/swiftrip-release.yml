@@ -1,0 +1,361 @@
+name: SwiftRip HandBrake Release
+
+on:
+  schedule:
+    - cron: "37 10 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream HandBrake tag to release, for example 1.11.1. Leave blank for latest stable."
+        required: false
+        type: string
+      rebuild_existing_release:
+        description: "Rebuild and replace an existing SwiftRip-HandBrake release."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: swiftrip-handbrake-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: HandBrake/HandBrake
+  LIBDVDREAD_PATCH: contrib/libdvdread/A03-macOS-hardened-runtime-dlopen.patch
+  SWIFTRIP_LIBDVDCSS_PATH: "@executable_path/../Frameworks/libdvdcss.2.dylib"
+  LEGACY_LIBDVDCSS_PATH: "/usr/local/lib/libdvdcss.2.dylib"
+
+jobs:
+  discover:
+    name: Discover upstream release
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_tag: ${{ steps.resolve.outputs.upstream_tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      swiftrip_branch: ${{ steps.resolve.outputs.swiftrip_branch }}
+      swiftrip_tag: ${{ steps.resolve.outputs.swiftrip_tag }}
+      source_tag_exists: ${{ steps.resolve.outputs.source_tag_exists }}
+      release_exists: ${{ steps.resolve.outputs.release_exists }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
+    steps:
+      - name: Checkout fork metadata
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve target release
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          requested_tag="${{ github.event.inputs.upstream_tag || '' }}"
+          rebuild_existing_release="${{ github.event.inputs.rebuild_existing_release || 'false' }}"
+          if [[ -n "$requested_tag" ]]; then
+            upstream_tag="${requested_tag#refs/tags/}"
+          else
+            upstream_tag="$(
+              git ls-remote --tags --refs "https://github.com/${UPSTREAM_REPOSITORY}.git" "refs/tags/[0-9]*" |
+                awk -F/ '{print $NF}' |
+                grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' |
+                sort -V |
+                tail -1
+            )"
+          fi
+
+          if [[ -z "$upstream_tag" ]]; then
+            echo "Unable to resolve an upstream HandBrake release tag." >&2
+            exit 1
+          fi
+
+          if ! [[ "$upstream_tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Only stable numeric HandBrake tags are supported: $upstream_tag" >&2
+            exit 1
+          fi
+
+          swiftrip_branch="swiftrip-${upstream_tag}"
+          swiftrip_tag="swiftrip-handbrake-${upstream_tag}"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${swiftrip_tag}" >/dev/null 2>&1; then
+            source_tag_exists=true
+            echo "SwiftRip tag already exists: ${swiftrip_tag}"
+          else
+            source_tag_exists=false
+            echo "SwiftRip tag does not exist yet: ${swiftrip_tag}"
+          fi
+
+          if gh release view "$swiftrip_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            release_exists=true
+            echo "SwiftRip release already exists: ${swiftrip_tag}"
+          else
+            release_exists=false
+            echo "SwiftRip release does not exist yet: ${swiftrip_tag}"
+          fi
+
+          if [[ "$release_exists" == "true" && "$rebuild_existing_release" != "true" ]]; then
+            should_build=false
+          else
+            should_build=true
+          fi
+
+          {
+            echo "upstream_tag=${upstream_tag}"
+            echo "version=${upstream_tag}"
+            echo "swiftrip_branch=${swiftrip_branch}"
+            echo "swiftrip_tag=${swiftrip_tag}"
+            echo "source_tag_exists=${source_tag_exists}"
+            echo "release_exists=${release_exists}"
+            echo "should_build=${should_build}"
+          } >> "$GITHUB_OUTPUT"
+
+  ensure-source:
+    name: Ensure SwiftRip source tag
+    runs-on: ubuntu-latest
+    needs: discover
+    if: needs.discover.outputs.should_build == 'true'
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create patched source branch and tag
+        if: needs.discover.outputs.source_tag_exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          upstream_tag="${{ needs.discover.outputs.upstream_tag }}"
+          swiftrip_branch="${{ needs.discover.outputs.swiftrip_branch }}"
+          swiftrip_tag="${{ needs.discover.outputs.swiftrip_tag }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git" || true
+          git fetch --depth 1 upstream "refs/tags/${upstream_tag}:refs/tags/${upstream_tag}"
+          git switch -C "$swiftrip_branch" "$upstream_tag"
+
+          if [[ ! -f "$LIBDVDREAD_PATCH" ]]; then
+            echo "Missing expected libdvdread patch: $LIBDVDREAD_PATCH" >&2
+            exit 1
+          fi
+
+          if ! grep -Fq "$LEGACY_LIBDVDCSS_PATH" "$LIBDVDREAD_PATCH"; then
+            echo "Expected legacy libdvdcss path was not found in $LIBDVDREAD_PATCH." >&2
+            echo "Upstream may have changed this patch; review before releasing." >&2
+            exit 1
+          fi
+
+          perl -0pi -e 's!\Q$ENV{LEGACY_LIBDVDCSS_PATH}\E!$ENV{SWIFTRIP_LIBDVDCSS_PATH}!g' "$LIBDVDREAD_PATCH"
+
+          if ! grep -Fq "$SWIFTRIP_LIBDVDCSS_PATH" "$LIBDVDREAD_PATCH"; then
+            echo "SwiftRip libdvdcss app-bundle path was not written." >&2
+            exit 1
+          fi
+
+          if grep -Fq "$LEGACY_LIBDVDCSS_PATH" "$LIBDVDREAD_PATCH"; then
+            echo "Legacy libdvdcss path is still present after patching." >&2
+            exit 1
+          fi
+
+          if [[ -d .github/workflows ]]; then
+            find .github/workflows -type f \( -name "*.yml" -o -name "*.yaml" \) -delete
+          fi
+
+          git add "$LIBDVDREAD_PATCH"
+          git add -A .github/workflows || true
+          git commit -m "Load libdvdcss from app bundle frameworks"
+          git tag -a "$swiftrip_tag" -m "SwiftRip HandBrake ${upstream_tag}"
+          git push origin "HEAD:refs/heads/${swiftrip_branch}"
+          git push origin "refs/tags/${swiftrip_tag}"
+
+      - name: Reuse existing source tag
+        if: needs.discover.outputs.source_tag_exists == 'true'
+        shell: bash
+        run: |
+          echo "Using existing source tag: ${{ needs.discover.outputs.swiftrip_tag }}"
+
+  build:
+    name: Build HandBrakeCLI ${{ matrix.arch }}
+    runs-on: macos-26
+    needs:
+      - discover
+      - ensure-source
+    if: needs.discover.outputs.should_build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - arm64
+          - x86_64
+    steps:
+      - name: Checkout SwiftRip source tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.discover.outputs.swiftrip_tag }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13.7"
+
+      - name: Toolchain cache
+        id: mac-toolchain
+        uses: actions/cache@v5
+        with:
+          path: ~/mac-toolchain
+          key: ${{ runner.os }}-${{ runner.arch }}-toolchain-${{ hashFiles('scripts/mac-toolchain-build') }}
+
+      - name: Cargo-C toolchain cache
+        id: mac-cargo-c-toolchain
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/cargo-capi
+            ~/.cargo/bin/cargo-cbuild
+            ~/.cargo/bin/cargo-cinstall
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-c-toolchain-${{ hashFiles('scripts/mac-toolchain-build') }}
+
+      - name: Set up build environment
+        shell: bash
+        run: |
+          echo "$HOME/mac-toolchain/bin" >> "$GITHUB_PATH"
+          rustup target add x86_64-apple-darwin
+          xcodebuild -downloadComponent MetalToolchain
+
+      - name: Build toolchain
+        if: steps.mac-toolchain.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          pip install setuptools
+          scripts/mac-toolchain-build "$HOME/mac-toolchain"
+
+      - name: Install cargo-c
+        if: steps.mac-cargo-c-toolchain.outputs.cache-hit != 'true'
+        shell: bash
+        run: cargo install cargo-c
+
+      - name: Build HandBrakeCLI
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          arch="${{ matrix.arch }}"
+          build_dir="build/swiftrip-${arch}"
+          prefix_dir="build/swiftrip-${arch}-prefix"
+          artifact_dir="artifacts/macos-${arch}"
+
+          env -u CPATH \
+            -u LIBRARY_PATH \
+            -u LD_LIBRARY_PATH \
+            -u DYLD_LIBRARY_PATH \
+            -u PKG_CONFIG_PATH \
+            -u CFLAGS \
+            -u CPPFLAGS \
+            -u CXXFLAGS \
+            -u LDFLAGS \
+            PKG_CONFIG_LIBDIR="${build_dir}/contrib/lib/pkgconfig" \
+            ./configure \
+              --force \
+              --disable-xcode \
+              --optimize size-aggressive \
+              --disable-x265 \
+              --disable-fdk-aac \
+              --disable-ffmpeg-aac \
+              --disable-ffmpeg-prores \
+              --disable-libdovi \
+              --arch "$arch" \
+              --build "$build_dir" \
+              --prefix "$prefix_dir" \
+              --launch \
+              --launch-jobs 0
+
+          mkdir -p "$artifact_dir"
+          cp "${build_dir}/HandBrakeCLI" "${artifact_dir}/HandBrakeCLI"
+
+          file "${artifact_dir}/HandBrakeCLI"
+          otool -L "${artifact_dir}/HandBrakeCLI"
+
+          if otool -L "${artifact_dir}/HandBrakeCLI" | grep -q "/opt/local"; then
+            echo "HandBrakeCLI links against /opt/local libraries." >&2
+            exit 1
+          fi
+
+          if ! grep -aFq "$SWIFTRIP_LIBDVDCSS_PATH" "${artifact_dir}/HandBrakeCLI"; then
+            echo "HandBrakeCLI does not contain the SwiftRip libdvdcss app-bundle path." >&2
+            exit 1
+          fi
+
+          if grep -aFq "$LEGACY_LIBDVDCSS_PATH" "${artifact_dir}/HandBrakeCLI"; then
+            echo "HandBrakeCLI still contains the legacy libdvdcss path." >&2
+            exit 1
+          fi
+
+          tar -C "$artifact_dir" -czf "HandBrakeCLI-macos-${arch}.tar.gz" HandBrakeCLI
+          shasum -a 256 "HandBrakeCLI-macos-${arch}.tar.gz" > "HandBrakeCLI-macos-${arch}.tar.gz.sha256"
+
+      - name: Upload HandBrakeCLI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: HandBrakeCLI-macos-${{ matrix.arch }}
+          path: |
+            HandBrakeCLI-macos-${{ matrix.arch }}.tar.gz
+            HandBrakeCLI-macos-${{ matrix.arch }}.tar.gz.sha256
+
+  release:
+    name: Publish SwiftRip HandBrake release
+    runs-on: ubuntu-latest
+    needs:
+      - discover
+      - build
+    if: needs.discover.outputs.should_build == 'true'
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${{ needs.discover.outputs.version }}"
+          swiftrip_tag="${{ needs.discover.outputs.swiftrip_tag }}"
+          release_exists="${{ needs.discover.outputs.release_exists }}"
+
+          cat > release-notes.md <<NOTES
+          SwiftRip-patched HandBrakeCLI build for upstream HandBrake ${version}.
+
+          This release is a candidate artifact for SwiftRip. SwiftRip does not
+          consume it automatically; SwiftRip-Tools must be updated to pin this
+          tag and commit deliberately.
+
+          Patch verification:
+          - libdvdcss lookup path: \`${SWIFTRIP_LIBDVDCSS_PATH}\`
+          - legacy \`${LEGACY_LIBDVDCSS_PATH}\` lookup rejected
+          - /opt/local runtime dependencies rejected
+          NOTES
+
+          if [[ "$release_exists" == "true" ]]; then
+            gh release delete "$swiftrip_tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --yes \
+              --cleanup-tag=false
+          fi
+
+          gh release create "$swiftrip_tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "SwiftRip HandBrake ${version}" \
+            --notes-file release-notes.md \
+            release-assets/*
