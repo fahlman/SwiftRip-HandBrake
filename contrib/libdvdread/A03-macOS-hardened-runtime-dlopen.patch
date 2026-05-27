@@ -5,7 +5,7 @@ diff --git a/src/dvd_input.c b/src/dvd_input.c
  
  #ifdef __APPLE__
    #define CSS_LIB "libdvdcss.2.dylib"
-+  #define CSS_USR_LOCAL_LIB "/usr/local/lib/libdvdcss.2.dylib"
++  #define CSS_APP_BUNDLE_LIB "@executable_path/../Frameworks/libdvdcss.2.dylib"
  #elif defined(_WIN32)
    #define CSS_LIB "libdvdcss-2.dll"
  #elif defined(__OS2__)
@@ -14,9 +14,9 @@ diff --git a/src/dvd_input.c b/src/dvd_input.c
  #endif
  
 +#ifdef __APPLE__
-+  // Use the absolute path, required by the hardened runtime
++  // Use the app bundle Frameworks copy, required by the hardened runtime.
 +  if(dvdcss_library == NULL) {
-+    dvdcss_library = dlopen(CSS_USR_LOCAL_LIB, RTLD_LAZY);
++    dvdcss_library = dlopen(CSS_APP_BUNDLE_LIB, RTLD_LAZY);
 +  }
 +#endif
 +
