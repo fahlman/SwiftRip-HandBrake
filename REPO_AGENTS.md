@@ -5,6 +5,11 @@ used to build SwiftRip's bundled HandBrakeCLI, not the SwiftRip application.
 
 ## Upstream and integration boundaries
 
+- Integrate SwiftRip fork changes, including these guide files, into
+  `swiftrip-1.11.2` on `fahlman/SwiftRip-HandBrake`. The tools repository pins
+  that fork line; `master` is not the integration base for this migration.
+  Keep published source tags immutable.
+
 - Read `README.markdown`, `CONTRIBUTING.md`, and the upstream source documentation.
   Preserve the existing cross-platform languages, configure/build system, and
   upstream layout; general SwiftUI defaults do not authorize rewriting this fork.
