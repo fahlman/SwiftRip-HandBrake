@@ -29,6 +29,22 @@ env:
   LEGACY_LIBDVDCSS_PATH: "/usr/local/lib/libdvdcss.2.dylib"
 
 jobs:
+  keepalive:
+    name: Keep scheduled release checks enabled
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Renew workflow activity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Scheduled runs alone do not reset GitHub's 60-day inactivity timer.
+        # Run independently so a discovery or build failure cannot skip renewal.
+        run: |
+          gh api --method PUT \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/swiftrip-release.yml/enable"
+
   discover:
     name: Discover upstream release
     runs-on: ubuntu-latest
